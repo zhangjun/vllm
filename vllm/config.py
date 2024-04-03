@@ -178,14 +178,15 @@ class ModelConfig:
             # compat: autogptq >=0.8.0 use checkpoint_format: str
             # compat: autogptq <=0.7.1 is_marlin_format: bool
             is_format_marlin = (quant_cfg.get("checkpoint_format") == "marlin"
-                                or quant_cfg.get("is_marlin_format", False))
+                                or quant_cfg.get("is_marlin_format", False) or
+                                quant_cfg.get("version") == "marlin")
 
             # Use marlin if the GPTQ model is serialized in marlin format.
-            if quant_method == "gptq" and is_format_marlin:
+            if (quant_method == "gptq" or quant_method == "awq") and is_format_marlin:
                 logger.info("The model is serialized in Marlin format. "
                             "Using Marlin kernel.")
                 quant_method = "marlin"
-                if self.quantization == "gptq":
+                if self.quantization == "gptq" or self.quantization == "awq":
                     self.quantization = quant_method
 
             if self.quantization is None:
