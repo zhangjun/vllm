@@ -72,6 +72,7 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}")
         linear_method = quant_config.get_linear_method()
+        print(linear_method)
 
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
@@ -92,6 +93,7 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
                 else:
                     model = model_class(model_config.hf_config,
                                         vision_language_config, linear_method)
+        print(model_class.__name__)
         if model_config.load_format == "dummy":
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
