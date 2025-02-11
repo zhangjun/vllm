@@ -358,6 +358,7 @@ class LlamaModel(nn.Module):
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
+            print("emb: ", hidden_states.shape)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -368,6 +369,11 @@ class LlamaModel(nn.Module):
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches[i - self.start_layer],
                                             attn_metadata, residual)
+            print(f"idx: {i}, {hidden_states.shape}",
+                  f"{residual.shape if residual is not None else None}",
+                  f"num_prefill_tokens: {attn_metadata.num_prefill_tokens}",
+                  f"num_decode_tokens: {attn_metadata.num_decode_tokens}",
+                  f"num_prefills: {attn_metadata.num_prefills}")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
