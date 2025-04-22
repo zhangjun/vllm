@@ -20,6 +20,7 @@ def vllm_version_matches_substr(substr: str) -> bool:
     """
     from importlib.metadata import PackageNotFoundError, version
     try:
+        logger.warning("Using ai_dynamo with vllm")
         vllm_version = version("vllm")
     except PackageNotFoundError as e:
         logger.warning(
