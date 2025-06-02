@@ -12,11 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """A GPU worker class."""
 import gc
 import os
-from typing import Dict, List, Optional, Set, Tuple, Type, Union, TYPE_CHECKING, Any
+from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed
@@ -24,10 +23,11 @@ import torch.distributed
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
-from vllm.distributed import (ensure_kv_transfer_initialized,
-                              ensure_model_parallel_initialized,
+from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
+from vllm.distributed.device_communicators.nixl import DynamoNixlConnector
+from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -35,6 +35,7 @@ from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.remote_prefill import MemoryOpType
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.utils import (GiB_bytes, MemorySnapshot, bind_kv_cache,
@@ -45,9 +46,6 @@ from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
-from vllm.distributed.device_communicators.nixl import DynamoNixlConnector
-from vllm.remote_prefill import MemoryOpType
-
 
 logger = init_logger(__name__)
 
@@ -88,7 +86,11 @@ class Worker(LocalOrDistributedWorkerBase):
             or (speculative_config.draft_model_config.hf_config.model_type ==
                 model_config.hf_config.model_type) \
             or (speculative_config.draft_model_config.hf_config.model_type
-                not in ("medusa", "mlp_speculator", "eagle", "deepseek_mtp")) \
+                not in ("medusa",
+                        "mlp_speculator",
+                        "eagle",
+                        "deepseek_mtp",
+                         "mimo_mtp")) \
                     else {"return_hidden_states": True}
 
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
@@ -111,6 +113,9 @@ class Worker(LocalOrDistributedWorkerBase):
         # Initialize gpu_cache as pooling models don't initialize kv_caches
         self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
         self._seq_group_metadata_cache: Dict[str, SequenceGroupMetadata] = {}
+
+        # Buffers saved before sleep
+        self._sleep_saved_buffers: Dict[str, torch.Tensor] = {}
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
@@ -138,9 +143,20 @@ class Worker(LocalOrDistributedWorkerBase):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+        print(
+            self.profiler.key_averages().table(sort_by="self_cuda_time_total"))
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+
+        # Save the buffers before level 2 sleep
+        if level == 2:
+            model = self.model_runner.model
+            self._sleep_saved_buffers = {
+                name: buffer.cpu().clone()
+                for name, buffer in model.named_buffers()
+            }
+
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
@@ -155,6 +171,14 @@ class Worker(LocalOrDistributedWorkerBase):
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
+
+        # Restore the buffers after level 2 sleep
+        if len(self._sleep_saved_buffers):
+            model = self.model_runner.model
+            for name, buffer in model.named_buffers():
+                if name in self._sleep_saved_buffers:
+                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            self._sleep_saved_buffers = {}
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -227,7 +251,7 @@ class Worker(LocalOrDistributedWorkerBase):
         Then, it calculate the maximum possible number of GPU and CPU blocks
         that can be allocated with the remaining free memory.
 
-        .. tip::
+        Tip:
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
@@ -329,36 +353,57 @@ class Worker(LocalOrDistributedWorkerBase):
         # TODO ptarasiewicz nixl can also support DRAM
         assert self.device_config.device_type == "cuda", "Currently only CUDA is supported for Nixl connector"
 
-        self.nixl_connector = DynamoNixlConnector(self.vllm_config, engine_id, self.local_rank) # TODO ptarasiewicz: rank or local_rank?
-        assert len(self.cache_engine) == 1, "Only one cache engine is supported for now"
+        self.nixl_connector = DynamoNixlConnector(
+            self.vllm_config, engine_id,
+            self.local_rank)  # TODO ptarasiewicz: rank or local_rank?
+        assert len(self.cache_engine
+                   ) == 1, "Only one cache engine is supported for now"
         self.nixl_connector.register_kv_caches(self.cache_engine[0].gpu_cache)
         return self.nixl_connector.agent_name
-    
+
     def get_nixl_agent_metadata(self) -> bytes:
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
         return self.nixl_connector.get_agent_metadata()
 
-    def add_remote_nixl_metadata(self, engine_id: str, agents_metadata: List[bytes], kv_caches_base_addr: List[List[Tuple[int, int]]], num_blocks: int) -> str:
+    def add_remote_nixl_metadata(self, engine_id: str,
+                                 agents_metadata: List[bytes],
+                                 kv_caches_base_addr: List[List[Tuple[int,
+                                                                      int]]],
+                                 num_blocks: int) -> str:
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
-        agent_name = self.nixl_connector.add_remote_agent(engine_id, agents_metadata, len(agents_metadata), kv_caches_base_addr, num_blocks) # TODO ptarasiewicz: rank or local_rank?
+        agent_name = self.nixl_connector.add_remote_agent(
+            engine_id, agents_metadata, len(agents_metadata),
+            kv_caches_base_addr,
+            num_blocks)  # TODO ptarasiewicz: rank or local_rank?
         return agent_name
-    
+
     def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
-        return self.nixl_connector.kv_caches_base_addr[self.nixl_connector.engine_id]
-        
+        return self.nixl_connector.kv_caches_base_addr[
+            self.nixl_connector.engine_id]
+
     def _read_blocks(self, worker_input: WorkerInput) -> None:
         for i, op_type in enumerate(worker_input.op_type):
             if op_type == MemoryOpType.READ:
-                self.nixl_connector.read_blocks(worker_input.local_block_ids[i], worker_input.staging_block_ids[i], worker_input.remote_block_ids[i], worker_input.remote_engine_id[i])
+                self.nixl_connector.read_blocks(
+                    worker_input.local_block_ids[i],
+                    worker_input.staging_block_ids[i],
+                    worker_input.remote_block_ids[i],
+                    worker_input.remote_engine_id[i])
 
     def _write_blocks(self, worker_input: WorkerInput) -> None:
         if not self.is_driver_worker:
-            torch.cuda.synchronize() # to make sure that the blocks are ready, on driver worker we transfer after sampling, so there's no need to synchronize
+            torch.cuda.synchronize(
+            )  # to make sure that the blocks are ready, on driver worker we transfer after sampling, so there's no need to synchronize
 
         for i, op_type in enumerate(worker_input.op_type):
             if op_type == MemoryOpType.WRITE:
-                self.nixl_connector.write_blocks(worker_input.local_block_ids[i], worker_input.staging_block_ids[i], worker_input.remote_block_ids[i], worker_input.remote_engine_id[i], worker_input.notify_msg[i])
+                self.nixl_connector.write_blocks(
+                    worker_input.local_block_ids[i],
+                    worker_input.staging_block_ids[i],
+                    worker_input.remote_block_ids[i],
+                    worker_input.remote_engine_id[i],
+                    worker_input.notify_msg[i])
 
     def shutdown_nixl(self) -> None:
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
@@ -425,7 +470,7 @@ class Worker(LocalOrDistributedWorkerBase):
         blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
                                       device=self.device,
                                       dtype=torch.int64).view(-1, 2)
-        
+
         mem_transfer_reqs = execute_model_req.memory_transfer_requests or []
 
         return WorkerInput(

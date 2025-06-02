@@ -16,44 +16,45 @@
 import pickle
 import signal
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Union, Dict
+from typing import Iterator, List, Optional, Union
 
 import cloudpickle
-import time
-import zmq
 import msgspec
+import zmq
+
 from vllm import AsyncEngineArgs, SamplingParams
 from vllm.config import VllmConfig
+from vllm.distributed.device_communicators.nixl import NixlMetadata
 from vllm.engine.llm_engine import LLMEngine
+from vllm.engine.metrics_types import (StatLoggerBase, Stats,
+                                       SupportsMetricsInfo)
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          IPC_HEALTH_EXT, IPC_INPUT_EXT,
+                                         IPC_METRICS_EXT, IPC_OUTPUT_EXT,
+                                         IPC_REMOTE_NIXL_METADATA_EXT,
+                                         IPC_REMOTE_PREFILL_REQUEST_EXT,
                                          REQUEST_OUTPUTS_T,
-                                         VLLM_RPC_SUCCESS_STR, IPC_REMOTE_PREFILL_REQUEST_EXT,
+                                         VLLM_RPC_SUCCESS_STR, KvMetrics,
                                          RPCAbortRequest,
-                                         IPC_OUTPUT_EXT, IPC_METRICS_EXT,
                                          RPCAdapterLoadedResponse, RPCError,
                                          RPCIsSleepingRequest,
                                          RPCIsSleepingResponse,
                                          RPCLoadAdapterRequest,
                                          RPCProcessRequest,
+                                         RPCResetMultiModalCacheRequest,
                                          RPCResetPrefixCacheRequest,
                                          RPCSleepRequest, RPCStartupRequest,
                                          RPCStartupResponse,
-                                         RPCUProfileRequest, RPCWakeUpRequest, KvMetrics,
-                                         IPC_REMOTE_NIXL_METADATA_EXT)
+                                         RPCUProfileRequest, RPCWakeUpRequest)
 # yapf: enable
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.remote_prefill import RemotePrefillRequest
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
 from vllm.usage.usage_lib import UsageContext
-from vllm.remote_prefill import RemotePrefillRequest
-from vllm.distributed.device_communicators.nixl import NixlMetadata
-
-from vllm.engine.metrics_types import StatLoggerBase, Stats, SupportsMetricsInfo
-from dataclasses import dataclass, field
 from vllm.worker.model_runner_base import InputProcessingError
 
 logger = init_logger(__name__)
@@ -61,13 +62,11 @@ logger = init_logger(__name__)
 POLLING_TIMEOUT_MS = 10000
 HEALTHY_RESPONSE = (pickle.dumps(VLLM_RPC_SUCCESS_STR), )
 
+
 class KvStatLogger(StatLoggerBase):
-    def __init__(
-        self,
-        max_num_seqs: int,
-        num_total_gpu_blocks: int,
-        metrics_socket
-    ):
+
+    def __init__(self, max_num_seqs: int, num_total_gpu_blocks: int,
+                 metrics_socket):
         # Must query initialized scheduler for max infos
         self.request_total_slots = max_num_seqs
         self.kv_total_blocks = num_total_gpu_blocks
@@ -80,10 +79,8 @@ class KvStatLogger(StatLoggerBase):
         self._send_kv_metrics(
             stats.num_running_sys,
             int(stats.gpu_cache_usage_sys * self.kv_total_blocks),
-            stats.num_waiting_sys,
-            stats.gpu_cache_usage_sys,
-            stats.gpu_prefix_cache_hit_rate
-        )
+            stats.num_waiting_sys, stats.gpu_cache_usage_sys,
+            stats.gpu_prefix_cache_hit_rate)
 
     def info(self, type: str, obj: SupportsMetricsInfo) -> None:
         pass
@@ -106,9 +103,9 @@ class KvStatLogger(StatLoggerBase):
                     num_requests_waiting,
                     gpu_cache_usage_perc,
                     gpu_prefix_cache_hit_rate,
-                )
-            )
+                ))
             self.metrics_socket.send_multipart((metrics_bytes, ), copy=False)
+
 
 # TODO: Send entire stats object to the client
 # class StatLogger(StatLoggerBase):
@@ -130,23 +127,23 @@ class KvStatLogger(StatLoggerBase):
 #             self.metrics_socket.send_multipart((metrics_bytes, ), copy=False)
 
 
-
-
-
 class MQLLMEngine:
-    """A multiprocessing wrapper for :class:`LLMEngine`.
+    """A multiprocessing wrapper for
+    [`LLMEngine`][vllm.engine.llm_engine.LLMEngine].
 
-    This class is used to wrap the :class:`LLMEngine` class to enable use
+    This class is used to wrap the
+    [`LLMEngine`][vllm.engine.llm_engine.LLMEngine] class to enable use
     in concurrnet manner. It runs a background loop and uses zeromq to
     receive new requests and stream outputs incrementally via ipc.
 
-    The :class:`LLMEngine` generate or encode process is kicked off when a new
-    RPCProcessRequest is received by the input_socket.
+    The [`LLMEngine`][vllm.engine.llm_engine.LLMEngine] generate or encode
+    process is kicked off when a new RPCProcessRequest is received by the
+    input_socket.
 
     The self.engine_loop checks the input_socket for new requests,
     adds them to the LLMEngine if there are any, calls the internal
-    :class:`LLMEngine.step()`, and sends the RequestOutputs back over
-    the output_socket.
+    [`LLMEngine.step()`][vllm.engine.llm_engine.LLMEngine.step], and sends
+    the RequestOutputs back over the output_socket.
 
     If use_async_sockets is set, the logic associated with reading new
     requests from the socket and sending data to the socket is passed
@@ -157,8 +154,8 @@ class MQLLMEngine:
         ipc_path: Base path for zeromq interprocess messaging
         use_async_sockets: Whether to make send/recv async with GPU
         log_requests: Whether to log the requests.
-        *args: Arguments for :class:`LLMEngine`.
-        **kwargs: Arguments for :class:`LLMEngine`.
+        *args: Arguments for [`LLMEngine`][vllm.engine.llm_engine.LLMEngine].
+        **kwargs: Arguments for [`LLMEngine`][vllm.engine.llm_engine.LLMEngine].
     """
 
     def __init__(self,
@@ -204,21 +201,21 @@ class MQLLMEngine:
         # Error state.
         self._errored_with: Optional[BaseException] = None
 
-        self.remote_prefill_request_socket = self.ctx.socket(zmq.constants.PUSH)
+        self.remote_prefill_request_socket = self.ctx.socket(
+            zmq.constants.PUSH)
         self.remote_nixl_metadata_socket = self.ctx.socket(zmq.constants.PULL)
         if self.engine.is_nixl_initialized:
-            self.remote_prefill_request_socket.bind(f"{ipc_path}{IPC_REMOTE_PREFILL_REQUEST_EXT}")
-            self.remote_nixl_metadata_socket.bind(f"{ipc_path}{IPC_REMOTE_NIXL_METADATA_EXT}")
-
+            self.remote_prefill_request_socket.bind(
+                f"{ipc_path}{IPC_REMOTE_PREFILL_REQUEST_EXT}")
+            self.remote_nixl_metadata_socket.bind(
+                f"{ipc_path}{IPC_REMOTE_NIXL_METADATA_EXT}")
 
         # Attach logger for continuous metrics publishing
         self.kv_stat_logger = KvStatLogger(
             self.engine.scheduler_config.max_num_seqs,
-            self.engine.cache_config.num_gpu_blocks,
-            self.metrics_socket
-        )
+            self.engine.cache_config.num_gpu_blocks, self.metrics_socket)
         self.engine.add_logger("kv_metrics", self.kv_stat_logger)
-        
+
         # TODO investigate sending whole stats object
         # self.general_stat_logger = StatLogger(
         #     self.metrics_socket
@@ -310,11 +307,12 @@ class MQLLMEngine:
                 # Handle the query from the Client.
                 if request == RPCStartupRequest.IS_SERVER_READY:
                     tracing_enabled = self.engine.is_tracing_enabled()
-            
+
                     # Send nixl metadata to the client
                     if self.engine.is_nixl_initialized:
                         nixl_metadata = self.engine.get_nixl_metadata()
-                        encoded_nixl_metadata = msgspec.msgpack.encode(nixl_metadata)
+                        encoded_nixl_metadata = msgspec.msgpack.encode(
+                            nixl_metadata)
                         response = RPCStartupResponse(
                             tracing_enabled=tracing_enabled,
                             nixl_metadata=encoded_nixl_metadata)
@@ -380,8 +378,10 @@ class MQLLMEngine:
             if self.engine.is_nixl_initialized:
                 while self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
                     frames = self.remote_nixl_metadata_socket.recv(copy=False)
-                    nixl_metadata = msgspec.msgpack.decode(frames.buffer, type=NixlMetadata)
-                    logger.debug("Adding remote nixl metadata for engine: %s", nixl_metadata.engine_id)
+                    nixl_metadata = msgspec.msgpack.decode(frames.buffer,
+                                                           type=NixlMetadata)
+                    logger.debug("Adding remote nixl metadata for engine: %s",
+                                 nixl_metadata.engine_id)
                     self.engine.add_remote_nixl_metadata(nixl_metadata)
 
             while self.input_socket.poll(timeout=0) != 0:
@@ -404,6 +404,8 @@ class MQLLMEngine:
                         self.stop_profile()
                 elif isinstance(request, RPCLoadAdapterRequest):
                     self._handle_load_adapter_request(request)
+                elif isinstance(request, RPCResetMultiModalCacheRequest):
+                    self.reset_mm_cache()
                 elif isinstance(request, RPCResetPrefixCacheRequest):
                     self.reset_prefix_cache()
                 elif isinstance(request, RPCSleepRequest):
@@ -419,7 +421,7 @@ class MQLLMEngine:
         except Exception as e:
             self._set_errored(e)
             self._send_unhealthy(e)
-            raise e
+            raise e from None
 
     def _handle_process_request(self, request: RPCProcessRequest):
         """Handle RPCProcessRequest by adding it to the LLMEngine."""
@@ -433,9 +435,14 @@ class MQLLMEngine:
 
         try:
             if request.remote_prefill_params is not None and request.remote_prefill_params.is_remote_prefill:
-                def remote_prefill_request_callback(request: RemotePrefillRequest):
-                    logger.debug("Sending remote prefill request: %s", request.request_id)
-                    self.remote_prefill_request_socket.send(msgspec.msgpack.encode(request), copy=False)
+
+                def remote_prefill_request_callback(
+                        request: RemotePrefillRequest):
+                    logger.debug("Sending remote prefill request: %s",
+                                 request.request_id)
+                    self.remote_prefill_request_socket.send(
+                        msgspec.msgpack.encode(request), copy=False)
+
                 request.remote_prefill_params.remote_prefill_request_callback = remote_prefill_request_callback
             self.engine.add_request(
                 request_id=request_id,
@@ -551,6 +558,9 @@ class MQLLMEngine:
     def stop_profile(self) -> None:
         self.engine.stop_profile()
 
+    def reset_mm_cache(self) -> bool:
+        return self.engine.reset_mm_cache()
+
     def reset_prefix_cache(self) -> bool:
         return self.engine.reset_prefix_cache()
 
@@ -589,4 +599,4 @@ def run_mp_engine(vllm_config: VllmConfig, usage_context: UsageContext,
     except BaseException as e:
         logger.exception(e)
         engine_alive.value = False
-        raise e
+        raise e from None

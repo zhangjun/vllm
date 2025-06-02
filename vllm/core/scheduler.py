@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import enum
 import os
 import random
 import time
-import copy
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional
 from typing import Sequence as GenericSequence
-from typing import Set, Tuple, Union, Any
+from typing import Set, Tuple, Union
 
-from vllm.config import ModelConfig, CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.config import CacheConfig, LoRAConfig, ModelConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -34,6 +34,7 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadataDelta, SequenceStage,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
+
 logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
@@ -500,7 +501,6 @@ class Scheduler:
 
         self._remote_prefill_outputs: Dict[str, int] = {}
 
-
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -657,7 +657,8 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0 or len(self.remote_prefilling) != 0 or len(self.prefill_sending) != 0
+            self.swapped) != 0 or len(self.remote_prefilling) != 0 or len(
+                self.prefill_sending) != 0
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
@@ -737,7 +738,7 @@ class Scheduler:
             if seq_group.request_id not in finished_prefills:
                 leftover_remote_prefilling_sequences.append(seq_group)
                 continue
-                
+
             else:
                 finished_prefills.remove(seq_group.request_id)
                 assert len(seq_group.seqs) == 1
@@ -747,7 +748,8 @@ class Scheduler:
                 seq.status = SequenceStatus.RUNNING
                 seq.data._stage = SequenceStage.DECODE
                 self.running.appendleft(seq_group)
-        remote_prefilling_queue.extendleft(leftover_remote_prefilling_sequences)
+        remote_prefilling_queue.extendleft(
+            leftover_remote_prefilling_sequences)
 
         remote_transfers_queue = self.prefill_sending
         leftover_remote_transfers_sequences: Deque[SequenceGroup] = deque()
@@ -1136,6 +1138,7 @@ class Scheduler:
             )
         ignored_seq_groups: List[SequenceGroup] = []
         seq_groups: List[ScheduledSequenceGroup] = []
+        using_prompt_embeds: bool = False
 
         waiting_queue = self.waiting
         num_remote_prefill_groups = 0
@@ -1189,7 +1192,8 @@ class Scheduler:
             # If the sequence group cannot be allocated, stop.
             is_remote_decode = seq_group.remote_prefill_params is not None and seq_group.remote_prefill_params.is_remote_decode
             can_allocate = self.block_manager.can_allocate(
-                seq_group, num_lookahead_slots=num_lookahead_slots,
+                seq_group,
+                num_lookahead_slots=num_lookahead_slots,
                 is_remote_decode=is_remote_decode)
             if can_allocate == AllocStatus.LATER:
                 break
@@ -1203,6 +1207,15 @@ class Scheduler:
                 for seq in waiting_seqs:
                     seq.status = SequenceStatus.FINISHED_IGNORED
                 ignored_seq_groups.append(seq_group)
+                waiting_queue.popleft()
+                continue
+
+            # We cannot mix sequence groups that use prompt embeds and
+            # those that do not.
+            if len(seq_groups) == 0:
+                using_prompt_embeds = seq_group.uses_prompt_embeds()
+            if using_prompt_embeds != seq_group.uses_prompt_embeds():
+                leftover_waiting_sequences.appendleft(seq_group)
                 waiting_queue.popleft()
                 continue
 
@@ -1242,13 +1255,17 @@ class Scheduler:
             seq_group_copy = copy.deepcopy(seq_group)
             seq_group_copy.seqs[0].seq_id = seq_group.seqs[0].seq_id + 1
 
-            logger.debug("Allocating and setting running or remote prefill for seq_group %s", seq_group.request_id)
+            logger.debug(
+                "Allocating and setting running or remote prefill for seq_group %s",
+                seq_group.request_id)
             logger.debug("Seq id: %s", seq_group.seqs[0].seq_id)
-            is_remote_prefill = self._allocate_and_set_running_or_remote_prefill(seq_group)
+            is_remote_prefill = self._allocate_and_set_running_or_remote_prefill(
+                seq_group)
             num_remote_prefill_groups += is_remote_prefill
             if is_remote_decode:
                 logger.debug("Seq id: %s", seq_group_copy.seqs[0].seq_id)
-                self._allocate_and_set_running_or_remote_prefill(seq_group_copy)
+                self._allocate_and_set_running_or_remote_prefill(
+                    seq_group_copy)
                 self.prefill_sending.append(seq_group_copy)
 
             if partial_prefill_metadata is not None:
@@ -1293,10 +1310,12 @@ class Scheduler:
             ignored_seq_groups=ignored_seq_groups,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=True, enable_chunking=enable_chunking),
-            num_remote_prefill_groups=num_remote_prefill_groups
-        )
+            num_remote_prefill_groups=num_remote_prefill_groups)
 
-    def _schedule_default(self, finished_prefills: Optional[Set[str]] = None, finished_transfers: Optional[Set[str]] = None) -> SchedulerOutputs:
+    def _schedule_default(
+            self,
+            finished_prefills: Optional[Set[str]] = None,
+            finished_transfers: Optional[Set[str]] = None) -> SchedulerOutputs:
         """Schedule queued requests.
 
         The current policy is designed to optimize the throughput. First,
@@ -1339,11 +1358,12 @@ class Scheduler:
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
         # only contains decode requests, not chunked prefills.
         if len(prefills.seq_groups) == 0:
-            running_scheduled = self._schedule_running(budget,
-                                                       curr_loras,
-                                                       enable_chunking=False,
-                                                       finished_prefills=finished_prefills,
-                                                       finished_transfers=finished_transfers)
+            running_scheduled = self._schedule_running(
+                budget,
+                curr_loras,
+                enable_chunking=False,
+                finished_prefills=finished_prefills,
+                finished_transfers=finished_transfers)
 
             # If any sequence group is preempted, do not swap in any sequence
             # group. because it means there's no slot for new running requests.
@@ -1385,17 +1405,39 @@ class Scheduler:
 
         # Merge lists
         num_prefill_groups = len(prefills.seq_groups)
+        ignored_seq_groups_for_embeds = list[SequenceGroup]()
         if num_prefill_groups > 0:
             scheduled_seq_groups = prefills.seq_groups
             scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
+            ignored_seq_groups_for_embeds.clear()
         else:
             scheduled_seq_groups = running_scheduled.decode_seq_groups
+            if len(scheduled_seq_groups) > 0:
+                using_prompt_embeds = scheduled_seq_groups[
+                    0].seq_group.uses_prompt_embeds()
+                ignored_seq_groups_for_embeds.clear()
+                indices_ignored = list[int]()
+                for i, schedule_seq_group in enumerate(scheduled_seq_groups):
+                    if using_prompt_embeds !=\
+                        schedule_seq_group.seq_group.uses_prompt_embeds():
+                        ignored_seq_groups_for_embeds.append(
+                            schedule_seq_group.seq_group)
+                        indices_ignored.append(i)
+                if len(ignored_seq_groups_for_embeds) > 0:
+                    scheduled_seq_groups = [
+                        group for i, group in enumerate(scheduled_seq_groups)
+                        if i not in indices_ignored
+                    ]
+            else:
+                ignored_seq_groups_for_embeds.clear()
+
         scheduled_seq_groups.extend(swapped_in.decode_seq_groups)
 
         blocks_to_copy = running_scheduled.blocks_to_copy
         blocks_to_copy.extend(swapped_in.blocks_to_copy)
 
         ignored_seq_groups = prefills.ignored_seq_groups
+        ignored_seq_groups.extend(ignored_seq_groups_for_embeds)
         ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
 
         return SchedulerOutputs(
@@ -1542,14 +1584,19 @@ class Scheduler:
         ]
         return finishing + not_finishing
 
-    def _schedule(self, finished_prefills: Optional[Set[str]] = None, finished_transfers: Optional[Set[str]] = None) -> SchedulerOutputs:
+    def _schedule(
+            self,
+            finished_prefills: Optional[Set[str]] = None,
+            finished_transfers: Optional[Set[str]] = None) -> SchedulerOutputs:
         """Schedule queued requests."""
         if self.scheduler_config.chunked_prefill_enabled:
             if finished_prefills or finished_transfers:
-                raise ValueError("Chunked prefill does not support remote prefills")
+                raise ValueError(
+                    "Chunked prefill does not support remote prefills")
             return self._schedule_chunked_prefill()
         else:
-            return self._schedule_default(finished_prefills, finished_transfers)
+            return self._schedule_default(finished_prefills,
+                                          finished_transfers)
 
     def _can_append_slots(self, seq_group: SequenceGroup,
                           enable_chunking: bool) -> bool:
@@ -1583,16 +1630,17 @@ class Scheduler:
         return no_single_seq
 
     def schedule(
-            self,
-            finished_prefills: Optional[Set[str]] = None,
-            finished_transfers: Optional[Set[str]] = None
+        self,
+        finished_prefills: Optional[Set[str]] = None,
+        finished_transfers: Optional[Set[str]] = None
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
 
         scheduler_start_time = time.perf_counter()
-        scheduler_outputs: SchedulerOutputs = self._schedule(finished_prefills, finished_transfers)
+        scheduler_outputs: SchedulerOutputs = self._schedule(
+            finished_prefills, finished_transfers)
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1631,7 +1679,9 @@ class Scheduler:
                 encoder_seq_data = None
                 cross_block_table = None
 
-            running_or_remote_prefilling_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING) + seq_group.get_seqs(status=SequenceStatus.REMOTE_PREFILLING)
+            running_or_remote_prefilling_seqs = seq_group.get_seqs(
+                status=SequenceStatus.RUNNING) + seq_group.get_seqs(
+                    status=SequenceStatus.REMOTE_PREFILLING)
             for seq in running_or_remote_prefilling_seqs:
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
@@ -1641,9 +1691,7 @@ class Scheduler:
             if self.cache_config.enable_prefix_caching:
                 common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
-                        running_or_remote_prefilling_seqs
-                    )
-                )
+                        running_or_remote_prefilling_seqs))
 
             do_sample = True
             is_prompt = seq_group.is_prefill()
@@ -1668,22 +1716,34 @@ class Scheduler:
             is_remote_prefill = False
             if is_first_prefill and seq_group.remote_prefill_params is not None and seq_group.remote_prefill_params.is_remote_prefill:
                 is_remote_prefill = True
-                logger.debug("Remote prefill, computed block nums: %s", common_computed_block_nums)
+                logger.debug("Remote prefill, computed block nums: %s",
+                             common_computed_block_nums)
             if is_first_prefill and seq_group.remote_prefill_params is not None and seq_group.remote_prefill_params.is_remote_decode:
-                block_tables[seq_group.seqs[0].seq_id + 1] = self.block_manager.block_tables[seq.seq_id + 1].physical_block_ids
+                block_tables[seq_group.seqs[0].seq_id +
+                             1] = self.block_manager.block_tables[
+                                 seq.seq_id + 1].physical_block_ids
 
                 # Since we know that prefill is scheduled we can
                 # assume that the blocks computed on decode
                 # will be fetched by the time we run prefill
-                logger.debug("Computed decode blocks: %s", seq_group.remote_prefill_params.decode_computed_block_ids)
+                logger.debug(
+                    "Computed decode blocks: %s",
+                    seq_group.remote_prefill_params.decode_computed_block_ids)
                 if seq_group.remote_prefill_params.decode_computed_block_ids:
-                    computed_block_ids = set(seq_group.remote_prefill_params.decode_computed_block_ids)
+                    computed_block_ids = set(seq_group.remote_prefill_params.
+                                             decode_computed_block_ids)
                     prefill_block_ids = block_tables[seq_group.seqs[0].seq_id]
-                    prefill_fetched_block_ids = [prefill_block_ids[i] for i, block_id in enumerate(seq_group.remote_prefill_params.decode_block_ids) if block_id in computed_block_ids and i < len(prefill_block_ids)]
-                    
-                    assert len(common_computed_block_nums) == 0, "common_computed_block_nums should be empty for remote prefill as it doesn't suport prefix caching"
-                    common_computed_block_nums = prefill_fetched_block_ids
+                    prefill_fetched_block_ids = [
+                        prefill_block_ids[i] for i, block_id in enumerate(
+                            seq_group.remote_prefill_params.decode_block_ids)
+                        if block_id in computed_block_ids
+                        and i < len(prefill_block_ids)
+                    ]
 
+                    assert len(
+                        common_computed_block_nums
+                    ) == 0, "common_computed_block_nums should be empty for remote prefill as it doesn't suport prefix caching"
+                    common_computed_block_nums = prefill_fetched_block_ids
 
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
@@ -1714,7 +1774,6 @@ class Scheduler:
                     multi_modal_placeholders=(
                         seq_group.multi_modal_placeholders
                         if scheduler_outputs.num_prefill_groups > 0 else None),
-                    mm_processor_kwargs=seq_group.mm_processor_kwargs,
                     prompt_adapter_request=seq_group.prompt_adapter_request,
                     do_remote_prefill=is_remote_prefill,
                 )
@@ -1815,7 +1874,8 @@ class Scheduler:
 
             self._async_stopped.clear()
 
-    def _allocate_and_set_running_or_remote_prefill(self, seq_group: SequenceGroup) -> bool:
+    def _allocate_and_set_running_or_remote_prefill(
+            self, seq_group: SequenceGroup) -> bool:
         self.block_manager.allocate(seq_group)
         is_remote_prefill = False
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):

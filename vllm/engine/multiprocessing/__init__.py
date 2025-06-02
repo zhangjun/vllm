@@ -21,14 +21,15 @@ from typing import List, Mapping, Optional, Union, overload
 from typing_extensions import deprecated
 
 from vllm import PoolingParams
+from vllm.distributed.device_communicators.nixl import NixlMetadata
 from vllm.inputs import PromptType
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.remote_prefill import RemotePrefillParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import Device, deprecate_kwargs
-from vllm.remote_prefill import RemotePrefillParams
-from vllm.distributed.device_communicators.nixl import NixlMetadata
+
 VLLM_RPC_SUCCESS_STR = "SUCCESS"
 
 IPC_INPUT_EXT = "_input_socket"
@@ -116,6 +117,7 @@ class RPCProcessRequest:
         self.priority = priority
         self.remote_prefill_params = remote_prefill_params
 
+
 @dataclass
 class RPCError:
     request_id: Optional[str]
@@ -137,9 +139,14 @@ class RPCStartupResponse:
     tracing_enabled: bool
     nixl_metadata: Optional[bytes] = None
 
+
 class RPCUProfileRequest(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+
+
+class RPCResetMultiModalCacheRequest(Enum):
+    RESET = 1
 
 
 @dataclass
@@ -183,6 +190,7 @@ class RPCAdapterLoadedResponse:
 
 RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
                       RPCUProfileRequest, RPCLoadAdapterRequest,
+                      RPCResetMultiModalCacheRequest,
                       RPCResetPrefixCacheRequest, RPCSleepRequest,
                       RPCWakeUpRequest, RPCIsSleepingRequest]
 
@@ -200,6 +208,7 @@ def ENGINE_DEAD_ERROR(
     return MQEngineDeadError(
         "Engine loop is not running. Inspect the stacktrace to "
         f"find the original error: {repr(error)}.")
+
 
 @dataclass
 class KvMetrics:

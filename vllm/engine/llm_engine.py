@@ -15,14 +15,11 @@
 
 import copy
 import time
-import pickle
 import uuid
 from collections import Counter as collectionsCounter
-from collections import deque
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
                     Iterable, List, Literal, Mapping, NamedTuple, Optional)
@@ -37,6 +34,7 @@ from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
+from vllm.distributed.device_communicators.nixl import NixlMetadata
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -46,9 +44,8 @@ from vllm.engine.output_processor.util import create_output_by_sequence_group
 from vllm.entrypoints.openai.logits_processors import (
     get_logits_processors as get_openai_logits_processors)
 from vllm.executor.executor_base import ExecutorBase
-from vllm.inputs import (INPUT_REGISTRY, InputRegistry, ProcessorInputs,
-                         PromptType, SingletonInputs)
-from vllm.inputs.parse import is_token_prompt, split_enc_dec_inputs
+from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
+from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.logits_process import get_bad_words_logits_processors
@@ -62,6 +59,8 @@ from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.remote_prefill import (MemoryOpType, MemoryTransferRequest,
+                                 RemotePrefillParams, RemotePrefillRequest)
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
                            PoolingSequenceGroupOutput, Sequence, SequenceGroup,
@@ -72,21 +71,17 @@ from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import (
-    BaseTokenizerGroup, init_tokenizer_from_configs)
+    TokenizerGroup, init_tokenizer_from_configs)
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import (Counter, Device, deprecate_kwargs,
                         resolve_obj_by_qualname, weak_bind)
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
-from vllm.remote_prefill import RemotePrefillRequest, RemotePrefillParams, MemoryTransferRequest, MemoryOpType
-from vllm.distributed.device_communicators.nixl import NixlMetadata
-
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
-_G = TypeVar("_G", bound=BaseTokenizerGroup, default=BaseTokenizerGroup)
 _O = TypeVar("_O", RequestOutput, PoolingRequestOutput)
 _R = TypeVar("_R", default=Any)
 
@@ -115,6 +110,7 @@ class OutputData(NamedTuple):
     skip: List[int]
     remote_prefill_requests: Optional[List[RemotePrefillRequest]]
 
+
 class SchedulerContext:
 
     def __init__(self, multi_step_stream_outputs: bool = False):
@@ -129,12 +125,15 @@ class SchedulerContext:
 
         self.remote_prefill_requests: List[RemotePrefillRequest] = []
 
-    def append_output(self, outputs: List[SamplerOutput],
+    def append_output(self,
+                      outputs: List[SamplerOutput],
                       seq_group_metadata_list: List[SequenceGroupMetadata],
-                      scheduler_outputs: SchedulerOutputs, is_async: bool,
+                      scheduler_outputs: SchedulerOutputs,
+                      is_async: bool,
                       is_last_step: bool,
                       is_first_step_output: Optional[bool],
-                      remote_prefill_requests: Optional[List[RemotePrefillRequest]] = None):
+                      remote_prefill_requests: Optional[
+                          List[RemotePrefillRequest]] = None):
         self.output_queue.append(
             OutputData(outputs=outputs,
                        seq_group_metadata_list=seq_group_metadata_list,
@@ -144,7 +143,6 @@ class SchedulerContext:
                        is_first_step_output=is_first_step_output,
                        skip=[],
                        remote_prefill_requests=remote_prefill_requests))
-
 
 
 class LLMEngine:
@@ -157,26 +155,16 @@ class LLMEngine:
     iteration-level scheduling and efficient memory management to maximize the
     serving throughput.
 
-    The :class:`~vllm.LLM` class wraps this class for offline batched inference
-    and the :class:`AsyncLLMEngine` class wraps this class for online serving.
+    The [`LLM`][vllm.LLM] class wraps this class for offline batched inference
+    and the [`AsyncLLMEngine`][vllm.engine.async_llm_engine.AsyncLLMEngine]
+    class wraps this class for online serving.
 
-    The config arguments are derived from :class:`~vllm.EngineArgs`. (See
-    :ref:`engine-args`)
+    The config arguments are derived from [`EngineArgs`][vllm.EngineArgs].
 
     Args:
-        model_config: The configuration related to the LLM model.
-        cache_config: The configuration related to the KV cache memory
-            management.
-        parallel_config: The configuration related to distributed execution.
-        scheduler_config: The configuration related to the request scheduler.
-        device_config: The configuration related to the device.
-        lora_config (Optional): The configuration related to serving multi-LoRA.
-        speculative_config (Optional): The configuration related to speculative
-            decoding.
+        vllm_config: The configuration for initializing and running vLLM.
         executor_class: The model executor class for managing distributed
             execution.
-        prompt_adapter_config (Optional): The configuration related to serving
-            prompt adapters.
         log_stats: Whether to log statistics.
         usage_context: Specified entry point, used for usage info collection.
     """
@@ -230,7 +218,7 @@ class LLMEngine:
 
         return outputs_
 
-    tokenizer: Optional[BaseTokenizerGroup]
+    tokenizer: Optional[TokenizerGroup]
 
     def __init__(
         self,
@@ -239,7 +227,6 @@ class LLMEngine:
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
-        input_registry: InputRegistry = INPUT_REGISTRY,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
@@ -300,11 +287,7 @@ class LLMEngine:
                                                     self.tokenizer,
                                                     mm_registry)
 
-        self.input_registry = input_registry
-        self.input_processor = input_registry.create_input_processor(
-            self.model_config)
-
-        self.model_executor = executor_class(vllm_config=vllm_config, )
+        self.model_executor = executor_class(vllm_config=vllm_config)
 
         if self.model_config.runner_type != "pooling":
             self._initialize_kv_caches()
@@ -346,11 +329,6 @@ class LLMEngine:
                     self.parallel_config.disable_custom_all_reduce,
                 })
 
-        if self.tokenizer:
-            # Ping the tokenizer to ensure liveness if it runs in a
-            # different process.
-            self.tokenizer.ping()
-
         self.cached_scheduler_outputs = [
             SchedulerOutputState()
             for _ in range(self.parallel_config.pipeline_parallel_size)
@@ -387,8 +365,8 @@ class LLMEngine:
             Scheduler = self.vllm_config.scheduler_config.scheduler_cls
         self.scheduler = [
             Scheduler(
-                self.model_config, self.scheduler_config, self.cache_config, self.lora_config,
-                self.parallel_config.pipeline_parallel_size,
+                self.model_config, self.scheduler_config, self.cache_config,
+                self.lora_config, self.parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id]
                 if self.model_config.use_async_output_proc else None)
             for v_id in range(self.parallel_config.pipeline_parallel_size)
@@ -436,10 +414,8 @@ class LLMEngine:
                 self.scheduler,
                 self.seq_counter,
                 get_tokenizer_for_seq,
-                stop_checker=StopChecker(
-                    self.scheduler_config.max_model_len,
-                    get_tokenizer_for_seq,
-                ),
+                stop_checker=StopChecker(self.scheduler_config.max_model_len,
+                                         get_tokenizer_for_seq),
             ))
 
         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
@@ -452,8 +428,10 @@ class LLMEngine:
         if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector":
             self._nixl_agents_names = self._initialize_nixl()
 
-        self._request_notif_counter = defaultdict(lambda: -self.parallel_config.tensor_parallel_size)
-        self._request_done_counter = defaultdict(lambda: -self.parallel_config.tensor_parallel_size)
+        self._request_notif_counter = defaultdict(
+            lambda: -self.parallel_config.tensor_parallel_size)
+        self._request_done_counter = defaultdict(
+            lambda: -self.parallel_config.tensor_parallel_size)
         self._finished_prefills = set()
         self._finished_transfers = set()
 
@@ -464,22 +442,34 @@ class LLMEngine:
     def get_nixl_metadata(self) -> NixlMetadata:
         if not self.is_nixl_initialized:
             raise RuntimeError("Nixl is not initialized")
-        agent_metadata = self.model_executor.collective_rpc("get_nixl_agent_metadata")
-        kv_caches_base_addr = self.model_executor.collective_rpc("get_nixl_kv_caches_base_addr")
-        return NixlMetadata(engine_id=self.engine_id, agent_metadata=agent_metadata, kv_caches_base_addr=kv_caches_base_addr, num_blocks=self.cache_config.num_gpu_blocks)
-    
-    def add_remote_nixl_metadata(self, nixl_metadata: NixlMetadata) -> List[str]:
+        agent_metadata = self.model_executor.collective_rpc(
+            "get_nixl_agent_metadata")
+        kv_caches_base_addr = self.model_executor.collective_rpc(
+            "get_nixl_kv_caches_base_addr")
+        return NixlMetadata(engine_id=self.engine_id,
+                            agent_metadata=agent_metadata,
+                            kv_caches_base_addr=kv_caches_base_addr,
+                            num_blocks=self.cache_config.num_gpu_blocks)
+
+    def add_remote_nixl_metadata(self,
+                                 nixl_metadata: NixlMetadata) -> List[str]:
         if not self.is_nixl_initialized:
             raise RuntimeError("Nixl is not initialized")
         engine_id = nixl_metadata.engine_id
         agents_metadata = nixl_metadata.agent_metadata
         kv_caches_base_addr = nixl_metadata.kv_caches_base_addr
         num_blocks = nixl_metadata.num_blocks
-        return self.model_executor.collective_rpc("add_remote_nixl_metadata", args=(engine_id, agents_metadata, kv_caches_base_addr, num_blocks))
+        return self.model_executor.collective_rpc(
+            "add_remote_nixl_metadata",
+            args=(engine_id, agents_metadata, kv_caches_base_addr, num_blocks))
 
     def _initialize_nixl(self) -> List[bytes]:
-        agents_names = self.model_executor.collective_rpc("initialize_nixl", args=(self.engine_id,))
+        agents_names = self.model_executor.collective_rpc(
+            "initialize_nixl", args=(self.engine_id, ))
         return agents_names
+
+        # Don't keep the dummy data in memory
+        self.reset_mm_cache()
 
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
@@ -597,21 +587,12 @@ class LLMEngine:
                 model_executor.collective_rpc("shutdown_nixl")
             model_executor.shutdown()
 
-    def get_tokenizer_group(
-        self,
-        group_type: Type[_G] = BaseTokenizerGroup,
-    ) -> _G:
-        tokenizer_group = self.tokenizer
-
-        if tokenizer_group is None:
+    def get_tokenizer_group(self) -> TokenizerGroup:
+        if self.tokenizer is None:
             raise ValueError("Unable to get tokenizer because "
                              "skip_tokenizer_init is True")
-        if not isinstance(tokenizer_group, group_type):
-            raise TypeError("Invalid type of tokenizer group. "
-                            f"Expected type: {group_type}, but "
-                            f"found type: {type(tokenizer_group)}")
 
-        return tokenizer_group
+        return self.tokenizer
 
     def get_tokenizer(
         self,
@@ -619,11 +600,10 @@ class LLMEngine:
     ) -> AnyTokenizer:
         return self.get_tokenizer_group().get_lora_tokenizer(lora_request)
 
-    def _init_tokenizer(self) -> BaseTokenizerGroup:
+    def _init_tokenizer(self) -> TokenizerGroup:
         return init_tokenizer_from_configs(
             model_config=self.model_config,
             scheduler_config=self.scheduler_config,
-            parallel_config=self.parallel_config,
             lora_config=self.lora_config)
 
     def _verify_args(self) -> None:
@@ -654,7 +634,9 @@ class LLMEngine:
         """
         if isinstance(params, SamplingParams) and params.n > 1:
             if remote_prefill_params is not None:
-                raise ValueError("Remote prefill params are not supported for multi-step sampling")
+                raise ValueError(
+                    "Remote prefill params are not supported for multi-step sampling"
+                )
             ParallelSampleSequenceGroup.add_request(
                 request_id,
                 self,
@@ -673,13 +655,14 @@ class LLMEngine:
         block_size = self.cache_config.block_size
         seq_id = next(self.seq_counter)
         if remote_prefill_params is not None and remote_prefill_params.is_remote_decode:
-            next(self.seq_counter) # empty sequence for staging
+            next(self.seq_counter)  # empty sequence for staging
         eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
 
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
-                       lora_request, prompt_adapter_request, remote_prefill_params)
+                       lora_request, prompt_adapter_request,
+                       remote_prefill_params)
 
         encoder_seq = (None if encoder_inputs is None else Sequence(
             seq_id, encoder_inputs, block_size, eos_token_id, lora_request,
@@ -701,7 +684,8 @@ class LLMEngine:
             )
         elif isinstance(params, PoolingParams):
             if remote_prefill_params is not None:
-                raise ValueError("Remote prefill params are not supported for pooling")
+                raise ValueError(
+                    "Remote prefill params are not supported for pooling")
             seq_group = self._create_sequence_group_with_pooling(
                 request_id,
                 seq,
@@ -736,6 +720,7 @@ class LLMEngine:
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
@@ -769,6 +754,7 @@ class LLMEngine:
             params: Optional[Union[SamplingParams, PoolingParams]] = None,
             arrival_time: Optional[float] = None,
             lora_request: Optional[LoRARequest] = None,
+            tokenization_kwargs: Optional[dict[str, Any]] = None,
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
@@ -784,11 +770,12 @@ class LLMEngine:
 
         Args:
             request_id: The unique ID of the request.
-            prompt: The prompt to the LLM. See :class:`~vllm.inputs.PromptType`
+            prompt: The prompt to the LLM. See
+                [PromptType][vllm.inputs.PromptType]
                 for more details about the format of each input.
             params: Parameters for sampling or pooling.
-                :class:`~vllm.SamplingParams` for text generation.
-                :class:`~vllm.PoolingParams` for pooling.
+                [SamplingParams][vllm.SamplingParams] for text generation.
+                [PoolingParams][vllm.PoolingParams] for pooling.
             arrival_time: The arrival time of the request. If None, we use
                 the current monotonic time.
             lora_request: The LoRA request to add.
@@ -800,10 +787,11 @@ class LLMEngine:
         Details:
             - Set arrival_time to the current time if it is None.
             - Set prompt_token_ids to the encoded prompt if it is None.
-            - Create `n` number of :class:`~vllm.Sequence` objects.
-            - Create a :class:`~vllm.SequenceGroup` object
-              from the list of :class:`~vllm.Sequence`.
-            - Add the :class:`~vllm.SequenceGroup` object to the scheduler.
+            - Create `n` number of [Sequence][vllm.Sequence] objects.
+            - Create a [SequenceGroup][vllm.SequenceGroup] object
+              from the list of [Sequence][vllm.Sequence].
+            - Add the [SequenceGroup][vllm.SequenceGroup] object to the
+              scheduler.
 
         Example:
             >>> # initialize engine
@@ -843,17 +831,18 @@ class LLMEngine:
         if arrival_time is None:
             arrival_time = time.time()
 
-        if self.tokenizer is not None:
-            self._validate_token_prompt(
-                prompt,
-                tokenizer=self.get_tokenizer(lora_request=lora_request))
+        if (isinstance(prompt, dict)
+                and prompt.get("prompt_embeds", None) is not None
+                and not prompt.get("prompt_token_ids", None)):
+            seq_len = prompt["prompt_embeds"].shape[0]
+            prompt["prompt_token_ids"] = [0] * seq_len
 
-        preprocessed_inputs = self.input_preprocessor.preprocess(
+        processed_inputs = self.input_preprocessor.preprocess(
             prompt,
+            tokenization_kwargs=tokenization_kwargs,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
-        processed_inputs = self.input_processor(preprocessed_inputs)
 
         self._add_processed_request(
             request_id=request_id,
@@ -866,27 +855,6 @@ class LLMEngine:
             priority=priority,
             remote_prefill_params=remote_prefill_params,
         )
-
-    def _validate_token_prompt(self, prompt: PromptType,
-                               tokenizer: AnyTokenizer):
-        # Guard against out-of-vocab tokens.
-        # For some tokenizers, tokenizer.decode will happily return empty text
-        # for token ids that are out of vocab, and we don't detect token ids
-        # that are greater than the max token id before running the model.
-        # However, these token ids will later crash a cuda kernel at runtime
-        # with an index out of bounds error. This will crash the entire engine.
-        # This needs to happen before multimodal input pre-processing, which
-        # may add dummy <image> tokens that aren't part of the tokenizer's
-        # vocabulary.
-        if is_token_prompt(prompt):
-            prompt_ids = prompt["prompt_token_ids"]
-            if len(prompt_ids) == 0:
-                # Empty prompt check is handled later
-                return
-            max_input_id = max(prompt_ids)
-            if max_input_id > tokenizer.max_token_id:
-                raise ValueError(
-                    "Token id {} is out of vocabulary".format(max_input_id))
 
     def _create_sequence_group_with_sampling(
         self,
@@ -974,9 +942,7 @@ class LLMEngine:
             request_id: The ID(s) of the request to abort.
 
         Details:
-            - Refer to the
-              :meth:`~vllm.core.scheduler.Scheduler.abort_seq_group`
-              from class :class:`~vllm.core.scheduler.Scheduler`.
+            - Refer to [vllm.core.scheduler.Scheduler.abort_seq_group][].
 
         Example:
             >>> # initialize engine and add a request with request_id
@@ -987,6 +953,10 @@ class LLMEngine:
         for scheduler in self.scheduler:
             scheduler.abort_seq_group(
                 request_id, seq_id_to_seq_group=self.seq_id_to_seq_group)
+
+    def get_vllm_config(self) -> VllmConfig:
+        """Gets the vllm configuration."""
+        return self.vllm_config
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""
@@ -1024,6 +994,10 @@ class LLMEngine:
         Returns True if there are unfinished requests for the virtual engine.
         """
         return self.scheduler[virtual_engine].has_unfinished_seqs()
+
+    def reset_mm_cache(self) -> bool:
+        """Reset the multi-modal cache."""
+        return self.input_preprocessor.mm_registry.reset_processor_cache()
 
     def reset_prefix_cache(self, device: Optional[Device] = None) -> bool:
         """Reset prefix cache for all devices."""
@@ -1104,11 +1078,12 @@ class LLMEngine:
             # When we process only one request, no pop is required
             # (since later we will process all of the rest)
             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
-             is_last_step, is_first_step_output, skip, remote_prefill_requests) = ctx.output_queue[0]
+             is_last_step, is_first_step_output, skip,
+             remote_prefill_requests) = ctx.output_queue[0]
         else:
             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
-             is_last_step, is_first_step_output,
-             skip, remote_prefill_requests) = ctx.output_queue.popleft()
+             is_last_step, is_first_step_output, skip,
+             remote_prefill_requests) = ctx.output_queue.popleft()
 
         # Sanity check
         assert len(seq_group_metadata_list) == len(
@@ -1357,62 +1332,65 @@ class LLMEngine:
                 if self.scheduler_config.is_multi_step:
                     is_prefill_append = seq.data.get_num_uncomputed_tokens(
                     ) == 0
-                    seq.append_token_id(sample.output_token, sample.logprobs)
+                    seq.append_token_id(sample.output_token, sample.logprobs,
+                                        sample.output_embed)
                     if not is_prefill_append:
                         seq_group.update_num_computed_tokens(1)
                 else:
-                    seq.append_token_id(sample.output_token, sample.logprobs)
+                    seq.append_token_id(sample.output_token, sample.logprobs,
+                                        sample.output_embed)
 
     def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
 
-        .. figure:: https://i.imgur.com/sv2HssD.png
-            :alt: Overview of the step function
-            :align: center
-
-            Overview of the step function.
+        <figure markdown="span">
+        ![Overview of the step function](https://i.imgur.com/sv2HssD.png)
+        <figcaption>Overview of the step function</figcaption>
+        </figure>
 
         Details:
-            - Step 1: Schedules the sequences to be executed in the next
-              iteration and the token blocks to be swapped in/out/copy.
+        - Step 1: Schedules the sequences to be executed in the next
+            iteration and the token blocks to be swapped in/out/copy.
 
-                - Depending on the scheduling policy,
-                  sequences may be `preempted/reordered`.
-                - A Sequence Group (SG) refer to a group of sequences
-                  that are generated from the same prompt.
+            - Depending on the scheduling policy,
+                sequences may be `preempted/reordered`.
+            - A Sequence Group (SG) refer to a group of sequences
+                that are generated from the same prompt.
 
-            - Step 2: Calls the distributed executor to execute the model.
-            - Step 3: Processes the model output. This mainly includes:
+        - Step 2: Calls the distributed executor to execute the model.
+        - Step 3: Processes the model output. This mainly includes:
 
-                - Decodes the relevant outputs.
-                - Updates the scheduled sequence groups with model outputs
-                  based on its `sampling parameters` (`use_beam_search` or not).
-                - Frees the finished sequence groups.
+            - Decodes the relevant outputs.
+            - Updates the scheduled sequence groups with model outputs
+                based on its `sampling parameters` (`use_beam_search` or not).
+            - Frees the finished sequence groups.
 
-            - Finally, it creates and returns the newly generated results.
+        - Finally, it creates and returns the newly generated results.
 
         Example:
-            >>> # Please see the example/ folder for more detailed examples.
-            >>>
-            >>> # initialize engine and request arguments
-            >>> engine = LLMEngine.from_engine_args(engine_args)
-            >>> example_inputs = [(0, "What is LLM?",
-            >>>    SamplingParams(temperature=0.0))]
-            >>>
-            >>> # Start the engine with an event loop
-            >>> while True:
-            >>>     if example_inputs:
-            >>>         req_id, prompt, sampling_params = example_inputs.pop(0)
-            >>>         engine.add_request(str(req_id),prompt,sampling_params)
-            >>>
-            >>>     # continue the request processing
-            >>>     request_outputs = engine.step()
-            >>>     for request_output in request_outputs:
-            >>>         if request_output.finished:
-            >>>             # return or show the request output
-            >>>
-            >>>     if not (engine.has_unfinished_requests() or example_inputs):
-            >>>         break
+        ```
+        # Please see the example/ folder for more detailed examples.
+
+        # initialize engine and request arguments
+        engine = LLMEngine.from_engine_args(engine_args)
+        example_inputs = [(0, "What is LLM?",
+        SamplingParams(temperature=0.0))]
+    
+        # Start the engine with an event loop
+        while True:
+            if example_inputs:
+                req_id, prompt, sampling_params = example_inputs.pop(0)
+                engine.add_request(str(req_id),prompt,sampling_params)
+
+            # continue the request processing
+            request_outputs = engine.step()
+            for request_output in request_outputs:
+                if request_output.finished:
+                    # return or show the request output
+
+            if not (engine.has_unfinished_requests() or example_inputs):
+                break
+        ```
         """
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
@@ -1436,7 +1414,8 @@ class LLMEngine:
         ctx.request_outputs.clear()
         ctx.remote_prefill_requests.clear()
 
-        remote_prefill_seq_group_metadata_list: List[SequenceGroupMetadata] = []
+        remote_prefill_seq_group_metadata_list: List[
+            SequenceGroupMetadata] = []
         running_seq_group_metadata_list: List[SequenceGroupMetadata] = []
         remote_prefill_scheduled_seq_groups: List[ScheduledSequenceGroup] = []
         running_scheduled_seq_groups: List[ScheduledSequenceGroup] = []
@@ -1452,41 +1431,52 @@ class LLMEngine:
             # Schedule iteration
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
-             ) = self.scheduler[virtual_engine].schedule(self._finished_prefills, self._finished_transfers)
-            
+             ) = self.scheduler[virtual_engine].schedule(
+                 self._finished_prefills, self._finished_transfers)
 
             # Separate remote prefill and running seq groups
-            for seq_group_metadata, scheduled_seq_group in zip(seq_group_metadata_list, scheduler_outputs.scheduled_seq_groups):
+            for seq_group_metadata, scheduled_seq_group in zip(
+                    seq_group_metadata_list,
+                    scheduler_outputs.scheduled_seq_groups):
                 if seq_group_metadata.do_remote_prefill:
-                    remote_prefill_seq_group_metadata_list.append(seq_group_metadata)
-                    remote_prefill_scheduled_seq_groups.append(scheduled_seq_group)
+                    remote_prefill_seq_group_metadata_list.append(
+                        seq_group_metadata)
+                    remote_prefill_scheduled_seq_groups.append(
+                        scheduled_seq_group)
                 else:
                     running_seq_group_metadata_list.append(seq_group_metadata)
                     running_scheduled_seq_groups.append(scheduled_seq_group)
 
             seq_group_metadata_list = running_seq_group_metadata_list
             scheduler_outputs.scheduled_seq_groups = running_scheduled_seq_groups
-            
+
             # Send remote prefill requests before model execution
-            for seq_group_metadata, scheduled_seq_group in zip(remote_prefill_seq_group_metadata_list, remote_prefill_scheduled_seq_groups):
+            for seq_group_metadata, scheduled_seq_group in zip(
+                    remote_prefill_seq_group_metadata_list,
+                    remote_prefill_scheduled_seq_groups):
                 assert len(scheduled_seq_group.seq_group.seqs) == 1
                 assert self._nixl_agents_names
                 seq_id = scheduled_seq_group.seq_group.seqs[0].seq_id
                 block_table = seq_group_metadata.block_tables[seq_id]
-                if len(block_table) == len(seq_group_metadata.computed_block_nums):
+                if len(block_table) == len(
+                        seq_group_metadata.computed_block_nums):
                     logger.debug("No blocks to prefill")
                     self._finished_prefills.add(seq_group_metadata.request_id)
                     continue
                 remote_prefill_request = RemotePrefillRequest(
                     request_id=seq_group_metadata.request_id,
                     # prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].inputs.prompt_token_ids[:-1], # last one will be decoded on decode for sampling anyway
-                    prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].inputs.prompt_token_ids, # TODO ptarasiewicz do not send the last token when NIXL fixes send notif (needed for writing 0 blocks)
-                    sampling_params=scheduled_seq_group.seq_group.sampling_params,
+                    prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].
+                    inputs.
+                    prompt_token_ids,  # TODO ptarasiewicz do not send the last token when NIXL fixes send notif (needed for writing 0 blocks)
+                    sampling_params=scheduled_seq_group.seq_group.
+                    sampling_params,
                     block_ids=block_table,
                     engine_id=self.engine_id,
                     computed_block_ids=seq_group_metadata.computed_block_nums,
                 )
-                scheduled_seq_group.seq_group.remote_prefill_params.remote_prefill_request_callback(remote_prefill_request)
+                scheduled_seq_group.seq_group.remote_prefill_params.remote_prefill_request_callback(
+                    remote_prefill_request)
 
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs
@@ -1543,39 +1533,47 @@ class LLMEngine:
 
             # After model execution, we need to transfer the memory from the prefill to the decode
             memory_transfer_reqs = []
-            for scheduled_seq_group, seq_group_metadata in zip(scheduler_outputs.scheduled_seq_groups, seq_group_metadata_list):
+            for scheduled_seq_group, seq_group_metadata in zip(
+                    scheduler_outputs.scheduled_seq_groups,
+                    seq_group_metadata_list):
                 remote_prefill_params = scheduled_seq_group.seq_group.remote_prefill_params
                 if remote_prefill_params is not None and remote_prefill_params.is_remote_decode:
                     assert len(scheduled_seq_group.seq_group.seqs) == 1
                     req_id = scheduled_seq_group.seq_group.request_id
                     seq_id = scheduled_seq_group.seq_group.seqs[0].seq_id
                     block_table = seq_group_metadata.block_tables[seq_id]
-                    staging_block_ids = seq_group_metadata.block_tables[seq_id + 1]
+                    staging_block_ids = seq_group_metadata.block_tables[seq_id
+                                                                        + 1]
 
-                    num_computed_blocks = len(seq_group_metadata.computed_block_nums)
-                    computed_decode_block_ids = remote_prefill_params.decode_block_ids[:num_computed_blocks]
+                    num_computed_blocks = len(
+                        seq_group_metadata.computed_block_nums)
+                    computed_decode_block_ids = remote_prefill_params.decode_block_ids[:
+                                                                                       num_computed_blocks]
 
                     if computed_decode_block_ids:
                         kv_recv_req = MemoryTransferRequest(
                             request_id=req_id,
                             local_block_ids=block_table[:num_computed_blocks],
-                            staging_block_ids=staging_block_ids[:num_computed_blocks],
+                            staging_block_ids=
+                            staging_block_ids[:num_computed_blocks],
                             remote_block_ids=computed_decode_block_ids,
-                            remote_engine_id=remote_prefill_params.decode_engine_id,
+                            remote_engine_id=remote_prefill_params.
+                            decode_engine_id,
                             notify_msg=req_id,
-                            op_type=MemoryOpType.READ
-                        )
+                            op_type=MemoryOpType.READ)
                         memory_transfer_reqs.append(kv_recv_req)
 
                     kv_send_req = MemoryTransferRequest(
                         request_id=req_id,
                         local_block_ids=block_table[num_computed_blocks:],
-                        staging_block_ids=staging_block_ids[num_computed_blocks:],
-                        remote_block_ids=remote_prefill_params.decode_block_ids[num_computed_blocks:],
-                        remote_engine_id=remote_prefill_params.decode_engine_id,
+                        staging_block_ids=staging_block_ids[
+                            num_computed_blocks:],
+                        remote_block_ids=remote_prefill_params.
+                        decode_block_ids[num_computed_blocks:],
+                        remote_engine_id=remote_prefill_params.
+                        decode_engine_id,
                         notify_msg=req_id,
-                        op_type=MemoryOpType.WRITE
-                    )
+                        op_type=MemoryOpType.WRITE)
                     memory_transfer_reqs.append(kv_send_req)
             execute_model_req.memory_transfer_requests = memory_transfer_reqs
 
@@ -1606,15 +1604,14 @@ class LLMEngine:
             if len(ctx.output_queue) > 0:
                 self._process_model_outputs(ctx=ctx)
             # No outputs in this case
-            execute_model_req = ExecuteModelRequest(
-                seq_group_metadata_list=[],
-                blocks_to_swap_in=[],
-                blocks_to_swap_out=[],
-                blocks_to_copy=[])
+            execute_model_req = ExecuteModelRequest(seq_group_metadata_list=[],
+                                                    blocks_to_swap_in=[],
+                                                    blocks_to_swap_out=[],
+                                                    blocks_to_copy=[])
 
             outputs, request_notif_counter, request_done_counter = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
-            
+
         for req_id, notif_count in request_notif_counter.items():
             self._request_notif_counter[req_id] += notif_count
             if self._request_notif_counter[req_id] > -1:
@@ -1685,7 +1682,7 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
-            
+
         return ctx.request_outputs
 
     def _abort_and_cache_schedule(
@@ -1858,6 +1855,20 @@ class LLMEngine:
         gpu_prefix_cache_hit_rate = self.scheduler[
             0].get_prefix_cache_hit_rate(Device.GPU)
 
+        # Exchange the uasge and cache hit stats between gpu and cpu when
+        # running on cpu because the cpu_worker.py intentionally reports the
+        # number of cpu blocks as gpu blocks in favor of cache management.
+        if self.device_config.device_type == "cpu":
+            num_total_gpu, num_total_cpu = num_total_cpu, num_total_gpu
+            gpu_cache_usage_sys, cpu_cache_usage_sys = (
+                cpu_cache_usage_sys,
+                gpu_cache_usage_sys,
+            )
+            gpu_prefix_cache_hit_rate, cpu_prefix_cache_hit_rate = (
+                cpu_prefix_cache_hit_rate,
+                gpu_prefix_cache_hit_rate,
+            )
+
         # Iteration stats
         num_prompt_tokens_iter = 0
         num_generation_tokens_iter = 0
@@ -1874,9 +1885,6 @@ class LLMEngine:
         time_inference_requests: List[float] = []
         time_prefill_requests: List[float] = []
         time_decode_requests: List[float] = []
-        time_in_queue_requests: List[float] = []
-        model_forward_time_requests: List[float] = []
-        model_execute_time_requests: List[float] = []
         #   Metadata
         num_prompt_tokens_requests: List[int] = []
         num_generation_tokens_requests: List[int] = []
@@ -1984,15 +1992,6 @@ class LLMEngine:
                             now - seq_group.metrics.first_token_time)
                         time_inference_requests.append(
                             now - seq_group.metrics.first_scheduled_time)
-                    if seq_group.metrics.time_in_queue is not None:
-                        time_in_queue_requests.append(
-                            seq_group.metrics.time_in_queue)
-                    if seq_group.metrics.model_forward_time is not None:
-                        model_forward_time_requests.append(
-                            seq_group.metrics.model_forward_time)
-                    if seq_group.metrics.model_execute_time is not None:
-                        model_execute_time_requests.append(
-                            seq_group.metrics.model_execute_time * 1000)
                     # Metadata
                     num_prompt_tokens_requests.append(
                         len(seq_group.prompt_token_ids))
@@ -2061,9 +2060,6 @@ class LLMEngine:
             time_inference_requests=time_inference_requests,
             time_prefill_requests=time_prefill_requests,
             time_decode_requests=time_decode_requests,
-            time_in_queue_requests=time_in_queue_requests,
-            model_forward_time_requests=model_forward_time_requests,
-            model_execute_time_requests=model_execute_time_requests,
             #   Metadata
             num_prompt_tokens_requests=num_prompt_tokens_requests,
             num_generation_tokens_requests=num_generation_tokens_requests,
@@ -2118,8 +2114,6 @@ class LLMEngine:
         return self.model_executor.is_sleeping
 
     def check_health(self) -> None:
-        if self.tokenizer:
-            self.tokenizer.check_health()
         self.model_executor.check_health()
 
     def is_tracing_enabled(self) -> bool:
@@ -2220,15 +2214,23 @@ class LLMEngine:
         tokenizer = (None if self.tokenizer is None else
                      self.tokenizer.get_lora_tokenizer(lora_request))
 
-        prompt_ids = prompt_inputs["prompt_token_ids"]
+        prompt_ids = prompt_inputs.get("prompt_token_ids", [])
         if not prompt_ids:
             if prompt_type == "encoder" and model_config.is_multimodal_model:
                 pass  # Mllama may have empty encoder inputs for text-only data
+            elif prompt_inputs["type"] == "embeds":
+                pass
             else:
                 raise ValueError(f"The {prompt_type} prompt cannot be empty")
 
+        if tokenizer is not None:
+            max_input_id = max(prompt_ids, default=0)
+            if max_input_id > tokenizer.max_token_id:
+                raise ValueError(
+                    f"Token id {max_input_id} is out of vocabulary")
+
         max_prompt_len = self.model_config.max_model_len
-        if len(prompt_ids) >= max_prompt_len:
+        if len(prompt_ids) > max_prompt_len:
             if prompt_type == "encoder" and model_config.is_multimodal_model:
                 mm_registry = self.input_preprocessor.mm_registry
                 mm_processor = mm_registry.create_processor(
@@ -2282,9 +2284,9 @@ class LLMEngine:
 
             tokenizer = self.get_tokenizer(lora_request=lora_request)
             guided_decoding.backend = guided_decoding.backend or \
-                self.decoding_config.guided_decoding_backend
+                self.decoding_config.backend
 
-            if self.decoding_config.reasoning_backend is not None:
+            if self.decoding_config.reasoning_backend:
                 logger.debug("Building with reasoning backend %s",
                              self.decoding_config.reasoning_backend)
 
