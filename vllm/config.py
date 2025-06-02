@@ -3543,17 +3543,12 @@ class KVTransferConfig:
     """The KV connector for vLLM to transmit KV caches between vLLM instances.
     """
 
-    engine_id: Optional[str] = None
-    """The engine id for KV transfers."""
-
-<<<<<<< HEAD
     # Whether to use NIXL prepped xfer for KV cache transfer.
     use_prepped_xfer: bool = True
 
-    # The device used by kv connector to buffer the KV cache.
-    # Currently only support 'cuda'.
-=======
->>>>>>> main
+    engine_id: Optional[str] = None
+    """The engine id for KV transfers."""
+
     kv_buffer_device: Optional[str] = "cuda"
     """The device used by kv connector to buffer the KV cache.
     Currently only support 'cuda'."""
@@ -3562,15 +3557,9 @@ class KVTransferConfig:
     """The buffer size for TorchDistributedConnector. Measured in number of
     bytes. Recommended value: 1e9 (about 1GB)."""
 
-<<<<<<< HEAD
-    # Whether this vLLM instance produces, consumes KV cache, or both. Choices
-    # are 'kv_producer', 'kv_consumer', and 'kv_both'.
-    kv_role: Optional[str] = None
-=======
     kv_role: Optional[KVRole] = None
     """Whether this vLLM instance produces, consumes KV cache, or both. Choices
     are 'kv_producer', 'kv_consumer', and 'kv_both'."""
->>>>>>> main
 
     kv_rank: Optional[int] = None
     """The rank of this vLLM instance in the KV cache transfer. Typical value:
@@ -3624,6 +3613,11 @@ class KVTransferConfig:
         if self.kv_connector is not None and self.kv_connector != "DynamoNixlConnector" and self.kv_role is None:
             raise ValueError("Please specify kv_disagg_role when kv_connector "
                              f"is set, supported roles are {get_args(KVRole)}")
+
+        if self.use_prepped_xfer is False:
+            logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
+            self.use_prepped_xfer = True
+
 
         if self.use_prepped_xfer is False:
             logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
