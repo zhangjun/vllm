@@ -3615,14 +3615,10 @@ class KVTransferConfig:
                              f"is set, supported roles are {get_args(KVRole)}")
 
         if self.use_prepped_xfer is False:
-            logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
+            logger.warning(
+                "`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer."
+            )
             self.use_prepped_xfer = True
-
-
-        if self.use_prepped_xfer is False:
-            logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
-            self.use_prepped_xfer = True
-
 
     @property
     def is_kv_transfer_instance(self) -> bool:
