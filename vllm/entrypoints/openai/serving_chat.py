@@ -467,6 +467,18 @@ class OpenAIServingChat(OpenAIServing):
         all_previous_token_ids: Optional[list[list[int]]]
         function_name_returned = [False] * num_choices
 
+        # batch send
+        last_yield_time = time.perf_counter()
+        should_yield = True
+        batch_interval = 0.0
+        batch_size = int(os.environ.get("VLLM_STREAM_OUT_BATCH", "0"))
+        if batch_size > 0:
+            should_yield = False
+            batch_interval = float(
+                os.environ.get("VLLM_STREAM_OUT_BATCH_INTERVAL", "1"))
+            batch_delta_text = [""] * num_choices
+            batch_delta_token_ids = [[]] * num_choices
+
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
         if tool_choice_auto or self.reasoning_parser:
@@ -620,6 +632,26 @@ class OpenAIServingChat(OpenAIServing):
                         not previous_num_tokens[i]:
                         # Chunked prefill case, don't return empty chunks
                         continue
+
+                    # batch_delta_text, batch_delta_token_ids
+                    if batch_size > 0:
+                        batch_delta_text[i] = batch_delta_text[i] + delta_text
+                        batch_delta_token_ids[i] = batch_delta_token_ids[i] + \
+                            list(output.token_ids)
+
+                    should_yield = True if output.finish_reason else False
+                    if len(delta) > batch_size or \
+                            time.perf_counter() - last_yield_time >= batch_interval or \
+                            delta and delta[-1] in "\n":
+                        should_yield = True
+
+                    if not should_yield:
+                        continue
+
+                    # for later use
+                    if batch_size > 0:
+                        output.token_ids = batch_delta_token_ids[i]
+                        delta_text = batch_delta_text[i]
 
                     delta_message: Optional[DeltaMessage]
 
@@ -912,6 +944,11 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                     data = chunk.model_dump_json(exclude_unset=True)
+                    # clear
+                    if batch_size > 0:
+                        batch_delta_token_ids[i] = []
+                        batch_delta_text[i] = ""
+                    last_yield_time = time.perf_counter()
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
